@@ -1,0 +1,4 @@
+libreoffice
+tesseract-ocr
+tesseract-ocr-chi-tra
+poppler-utils
