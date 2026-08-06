@@ -1,0 +1,1813 @@
+# -*- coding: utf-8 -*-
+"""
+備標人員附錄整理、證照檢核與 CV 結構化轉檔系統
+==================================================
+功能：
+1. 依人員名單 Excel 排序，將每位同仁的 CV / 學歷 / 證照 / 技師執業執照 /
+   技師會員證 / 投保證明，依標準 6 分類順序合併成單一附錄 PDF。
+2. 自動掃描技師執業執照與公會會員證內文字，判讀民國年效期，產出「已過期 /
+   即將過期 / 有效」檢核報告。
+3. 呼叫 Gemini AI 解析每位同仁 CV 全文，結構化萃取為符合
+   Template_Staffing.xlsx 標準格式的 13 個欄位。
+
+部署需求（Streamlit Community Cloud）：
+- 本機 / 雲端皆需安裝 LibreOffice（將 .doc/.docx 轉為 PDF 供合併，以及供
+  文字擷取備援）。若部署到 Streamlit Cloud，請在 repo 根目錄新增
+  `packages.txt`，內容如下（本工具已一併產生於輸出資料夾）：
+      libreoffice
+      tesseract-ocr
+      tesseract-ocr-chi-tra
+      poppler-utils
+- Gemini API Key：於 App 的 Settings -> Secrets 貼上
+      GEMINI_API_KEY = "你的 Gemini API Key"
+  或於側邊欄手動輸入（僅存於本次瀏覽器工作階段）。
+
+本機執行：
+    pip install -r requirements.txt
+    streamlit run app.py
+"""
+
+import difflib
+import io
+import json
+import os
+import random
+import re
+import subprocess
+import tempfile
+import time
+import zipfile
+from datetime import date
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+import openpyxl
+
+try:
+    from docx import Document as DocxDocument
+except Exception:  # pragma: no cover
+    DocxDocument = None
+
+try:
+    from pypdf import PdfReader, PdfWriter
+except Exception:  # pragma: no cover
+    PdfReader = None
+    PdfWriter = None
+
+try:
+    import pdfplumber
+except Exception:  # pragma: no cover
+    pdfplumber = None
+
+try:
+    from PIL import Image
+except Exception:  # pragma: no cover
+    Image = None
+
+try:
+    from google import genai
+    GENAI_AVAILABLE = True
+except Exception:  # pragma: no cover
+    GENAI_AVAILABLE = False
+    genai = None
+
+
+# ============================================================
+# 常數設定
+# ============================================================
+
+CATEGORY_ORDER = [
+    "1_CV",
+    "2_學歷",
+    "3_證照",
+    "4_技師執業執照",
+    "5_技師會員證",
+    "6_投保證明",
+]
+
+CATEGORY_LABELS = {
+    "1_CV": "CV／履歷",
+    "2_學歷": "學歷證明",
+    "3_證照": "一般證照",
+    "4_技師執業執照": "技師執業執照",
+    "5_技師會員證": "技師公會會員證",
+    "6_投保證明": "投保證明",
+}
+
+CATEGORY_KEYWORDS = {
+    "6_投保證明": ["投保", "被保險人", "被保险人", "勞保", "劳保", "勞退"],
+    "2_學歷": ["畢業", "毕业", "學歷", "学历", "學位", "学位"],
+}
+
+# CV 檔名關鍵字（擴充：學經歷／經歷表）
+CV_FILENAME_KEYWORDS = ["cv", "履歷", "履历", "學經歷", "学经历", "經歷表", "经历表"]
+
+# 三段式雙軌配對機制信心度門檻
+HIGH_CONFIDENCE_THRESHOLD = 0.80
+MEDIUM_CONFIDENCE_THRESHOLD = 0.60
+
+TEMPLATE_COLUMNS = [
+    "Layer", "Role", "GroupName", "Name", "Title", "Company", "Badges",
+    "PhotoName", "YearsOfExp", "Degree", "JobDescription", "Expertise",
+    "BioNarrative",
+]
+
+LAYER_OPTIONS = ["Top", "SubTop", "Advisor", "Middle", "GroupLeader",
+                  "GroupMember", "Subcontractor"]
+
+BADGE_SORT_ORDER = ["技", "碩", "博", "品", "安", "採", "乙", "甲", "景", "土", "水"]
+
+DEFAULT_MODEL_CHAIN = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+]
+
+EXCLUDE_DIR_TOKENS = ["目前不需要", "不需要", "__macosx", ".git"]
+
+
+# ============================================================
+# 工具函式：檔案分類與人名比對
+# ============================================================
+
+def classify_category_by_filename_hint(fname_lower: str) -> str:
+    """僅用於投保證明／學歷證明（內容結構化程度低，維持以檔名關鍵字判斷）。
+    找不到關鍵字則回傳 None，交由主分類流程繼續判斷。"""
+    for cat in ["6_投保證明", "2_學歷"]:
+        for kw in CATEGORY_KEYWORDS[cat]:
+            if kw.lower() in fname_lower:
+                return cat
+    return None
+
+
+# ------------------------------------------------------------
+# 三段式雙軌配對機制（姓名 + 英文姓名，容錯拼寫誤差）
+# ------------------------------------------------------------
+
+def normalize_name(s: str) -> str:
+    """轉小寫並移除常見分隔符號，供比對使用。"""
+    s = str(s or "").lower()
+    s = re.sub(r"[_\-()（）\s,，、.。]", "", s)
+    return s
+
+
+def _windowed_ratio(alias_norm: str, stem_norm: str) -> float:
+    """計算 alias 與檔名（正規化後）的相似度，錨定於檔名最左側區段，
+    並輔以全字串比對，兼顧「姓名在最左側」與「姓名夾雜於中段」兩種情況。"""
+    if not alias_norm or not stem_norm:
+        return 0.0
+    if alias_norm in stem_norm:
+        return 1.0
+
+    best = 0.0
+    lo = max(1, len(alias_norm) - 3)
+    hi = min(len(stem_norm), len(alias_norm) + 6)
+    for end in range(lo, hi + 1):
+        window = stem_norm[:end]
+        ratio = difflib.SequenceMatcher(None, alias_norm, window).ratio()
+        if ratio > best:
+            best = ratio
+
+    full_ratio = difflib.SequenceMatcher(None, alias_norm, stem_norm).ratio()
+    return max(best, full_ratio)
+
+
+def build_alias_list(df_people: pd.DataFrame) -> list:
+    """回傳 [(alias_norm, alias_original, person_name), ...]，
+    姓名與英文姓名皆納入比對清單。"""
+    aliases = []
+    for _, row in df_people.iterrows():
+        person = str(row["姓名"]).strip()
+        for col in ["姓名", "英文姓名"]:
+            val = row.get(col, "") if col in df_people.columns else ""
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                continue
+            val = str(val).strip()
+            if val and val.lower() != "nan":
+                aliases.append((normalize_name(val), val, person))
+    return aliases
+
+
+def match_person_candidates(filename: str, aliases: list) -> list:
+    """回傳依信心分數（0~1）由高到低排序的
+    [(person_name, score, matched_alias_text), ...]。"""
+    stem = Path(filename).stem
+    stem_norm = normalize_name(stem)
+
+    best_per_person = {}
+    for alias_norm, alias_text, person in aliases:
+        score = _windowed_ratio(alias_norm, stem_norm)
+        if person not in best_per_person or score > best_per_person[person][0]:
+            best_per_person[person] = (score, alias_text)
+
+    ranked = sorted(
+        [(person, score, alias_text) for person, (score, alias_text) in best_per_person.items()],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+    return ranked
+
+
+# ============================================================
+# 工具函式：格式轉換
+# ============================================================
+
+def convert_to_pdf(filepath: str, workdir: str):
+    """將 docx/doc/圖片轉為 PDF；已是 PDF 則直接回傳原路徑。失敗回傳 None。"""
+    ext = Path(filepath).suffix.lower()
+    if ext == ".pdf":
+        return filepath
+
+    if ext in (".doc", ".docx"):
+        try:
+            subprocess.run(
+                ["libreoffice", "--headless", "--convert-to", "pdf",
+                 "--outdir", workdir, filepath],
+                check=True, timeout=180, capture_output=True,
+            )
+            out_path = Path(workdir) / (Path(filepath).stem + ".pdf")
+            return str(out_path) if out_path.exists() else None
+        except Exception:
+            return None
+
+    if ext in (".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif") and Image is not None:
+        try:
+            img = Image.open(filepath).convert("RGB")
+            out_path = Path(workdir) / (Path(filepath).stem + ".pdf")
+            img.save(out_path, "PDF")
+            return str(out_path)
+        except Exception:
+            return None
+
+    return None
+
+
+def extract_docx_text(filepath: str, workdir: str) -> str:
+    """讀取 Word CV 全文（含表格）。.doc 會先透過 LibreOffice 轉為 .docx。"""
+    ext = Path(filepath).suffix.lower()
+    target = filepath
+
+    if ext == ".doc":
+        try:
+            subprocess.run(
+                ["libreoffice", "--headless", "--convert-to", "docx",
+                 "--outdir", workdir, filepath],
+                check=True, timeout=180, capture_output=True,
+            )
+            converted = Path(workdir) / (Path(filepath).stem + ".docx")
+            if converted.exists():
+                target = str(converted)
+        except Exception:
+            pass
+
+    if DocxDocument is None:
+        return ""
+
+    try:
+        doc = DocxDocument(target)
+        parts = [p.text for p in doc.paragraphs if p.text.strip()]
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    if cell.text.strip():
+                        parts.append(cell.text.strip())
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
+
+def extract_cv_text(filepath: str, workdir: str) -> str:
+    """依副檔名分派 CV 文字擷取方式：.pdf 走 PDF 文字/OCR 擷取，
+    .doc/.docx 走 Word 段落/表格擷取。確保 PDF 格式 CV 不再被跳過。"""
+    ext = Path(filepath).suffix.lower()
+    if ext == ".pdf":
+        return extract_pdf_text(filepath)
+    if ext in (".doc", ".docx"):
+        return extract_docx_text(filepath, workdir)
+    return ""
+
+
+def extract_pdf_text(pdf_path: str) -> str:
+    """從 PDF 擷取文字，若為掃描檔（無文字層）則嘗試 OCR 備援。"""
+    text = ""
+    if pdfplumber is not None:
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                for page in pdf.pages:
+                    t = page.extract_text()
+                    if t:
+                        text += t + "\n"
+        except Exception:
+            pass
+
+    if not text.strip():
+        try:
+            from pdf2image import convert_from_path
+            import pytesseract
+            images = convert_from_path(pdf_path, dpi=200)
+            for img in images:
+                text += pytesseract.image_to_string(img, lang="chi_tra+eng") + "\n"
+        except Exception:
+            pass
+
+    return text
+
+
+def classify_file_content(filepath: str, workdir: str):
+    """內文導向（Content-Driven）分類。回傳 (category, extracted_text)。
+
+    - 1_CV：以檔名關鍵字（CV/履歷/學經歷/經歷表，不分大小寫）或 Word 副檔名
+      （.doc/.docx，不分大小寫）快速判定，不需額外 OCR。
+    - 4_技師執業執照：需先擷取 PDF/圖片內文字（含 OCR 備援），內文包含
+      「技師執業執照」或「執業執照」才成立。
+    - 5_技師會員證：內文「同時」包含「會員證」與「技師公會」才成立
+      （例如：台北市水利技師公會、台灣省水利技師公會），避免景觀學會等
+      一般協會會員證被誤判。
+    - 6_投保證明 / 2_學歷：內容結構化程度低，維持以檔名關鍵字判斷。
+    - 其餘：歸為 3_證照，不進行過期告警。
+
+    extracted_text 僅在實際執行過 PDF/OCR 擷取時回傳（CV／未擷取則為 None），
+    供效期檢核複用，避免對同一檔案重複 OCR。
+    """
+    fname = os.path.basename(filepath)
+    fname_lower = fname.lower()
+    ext = Path(filepath).suffix.lower()
+
+    if any(kw.lower() in fname_lower for kw in CV_FILENAME_KEYWORDS):
+        return "1_CV", None
+    if ext in (".doc", ".docx"):
+        return "1_CV", None
+
+    pdf_path = filepath if ext == ".pdf" else convert_to_pdf(filepath, workdir)
+    text = extract_pdf_text(pdf_path) if pdf_path else ""
+
+    if "技師執業執照" in text or "執業執照" in text or "执业执照" in text:
+        return "4_技師執業執照", text
+
+    has_member_kw = ("會員證" in text) or ("会员证" in text)
+    has_guild_kw = ("技師公會" in text) or ("技师公会" in text)
+    if has_member_kw and has_guild_kw:
+        return "5_技師會員證", text
+
+    hint = classify_category_by_filename_hint(fname_lower)
+    if hint:
+        return hint, text
+
+    return "3_證照", text
+
+
+# ============================================================
+# 證照效期檢核
+# ============================================================
+
+DATE_RANGE_PATTERN = re.compile(
+    r"(?:自)?民國\s*(\d{2,3})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*"
+    r"(?:止|至)\s*(?:民國\s*)?(\d{2,3})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日"
+)
+
+# 「115年會員證」／「115年度會員證」等只標示單一年度、無明確起訖日的格式：
+# 推算至該年12/31止（僅供 5_技師會員證 使用）
+YEAR_ONLY_PATTERN = re.compile(r"(\d{2,3})\s*年度?\s*(?:會員證|会员证)")
+
+# 備援：專門抓取「至／~／～」或緊接在其後、直到「止」為止的截止日期。
+# 用於 OCR 誤判、格式跑版等導致「起訖日全段」比對失敗，但截止日文字仍可辨識的情況
+# （如「羅翊軒」「潘冠愷」執照因掃描雜訊導致起始日段落抓不到）。
+END_DATE_ONLY_PATTERN = re.compile(
+    r"(?:至|~|～)\s*(?:民國\s*)?(\d{2,3})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*(?:止)?"
+)
+
+
+def parse_license_expiry(category: str, text: str) -> dict:
+    """依「已擷取好」的內文文字解析證照效期，僅供 4_技師執業執照 與
+    5_技師會員證 呼叫；不重複進行 PDF/OCR 擷取。日期一律以呼叫當下的
+    date.today() 動態計算，避免因常數在應用程式啟動時凍結而產生誤判。
+
+    優先順序：明確起訖日期 > 單一年度（僅會員證，推算至當年12/31）
+    > 僅截止日備援（聚焦「至/~/止」後方日期，因應 OCR 起始日段落判讀失敗）。
+    """
+    if not text or not text.strip():
+        return {"狀態": "⚠️ 無法自動判讀（掃描檔/OCR不可用）", "起始日": "", "截止日": "",
+                "備註": "請人工確認"}
+
+    start = end = None
+
+    m = DATE_RANGE_PATTERN.search(text)
+    if m:
+        ry1, rm1, rd1, ry2, rm2, rd2 = map(int, m.groups())
+        try:
+            start = date(ry1 + 1911, rm1, rd1)
+            end = date(ry2 + 1911, rm2, rd2)
+        except ValueError:
+            return {"狀態": "⚠️ 日期格式錯誤", "起始日": "", "截止日": "", "備註": "請人工確認"}
+    elif category == "5_技師會員證":
+        m2 = YEAR_ONLY_PATTERN.search(text)
+        if m2:
+            ry = int(m2.group(1))
+            try:
+                start = date(ry + 1911, 1, 1)
+                end = date(ry + 1911, 12, 31)
+            except ValueError:
+                return {"狀態": "⚠️ 日期格式錯誤", "起始日": "", "截止日": "", "備註": "請人工確認"}
+
+    if end is None:
+        m3 = END_DATE_ONLY_PATTERN.search(text)
+        if m3:
+            ry2, rm2, rd2 = map(int, m3.groups())
+            try:
+                end = date(ry2 + 1911, rm2, rd2)
+                start = None  # 起始日因 OCR 判讀失敗而未知，僅顯示截止日
+            except ValueError:
+                return {"狀態": "⚠️ 日期格式錯誤", "起始日": "", "截止日": "", "備註": "請人工確認"}
+
+    if end is None:
+        return {"狀態": "⚠️ 未偵測到效期文字", "起始日": "", "截止日": "", "備註": "請人工確認"}
+
+    today = date.today()
+    days_left = (end - today).days
+    if days_left < 0:
+        status = "🔴 已過期"
+        remark = f"逾期 {-days_left} 天"
+    elif days_left <= 90:
+        status = "🟡 即將過期（90天內）"
+        remark = f"剩 {days_left} 天"
+    else:
+        status = "🟢 有效"
+        remark = f"剩 {days_left} 天"
+
+    return {"狀態": status, "起始日": start.isoformat() if start else "（OCR未判讀）",
+            "截止日": end.isoformat(), "備註": remark}
+
+
+# ============================================================
+# 投保年資精準離線擷取（完全不消耗 AI 額度）
+# ============================================================
+
+INSURANCE_YEARS_PATTERN = re.compile(r"勞保投保年資\s*[:：]\s*(\d+)\s*年\s*(\d+)\s*日")
+
+
+def parse_insurance_years(text: str):
+    """從投保證明內文（如「勞保投保年資：6年 309日（截至115/07/22止）」）
+    離線解析年資，完全不呼叫任何 AI API。
+
+    換算規則：日數 >= 180 則年數 +1（四捨五入進位）；否則直接取年數。
+    找不到符合格式的文字則回傳 None，交由 Gemini AI 從 CV 內容推算年資。
+    """
+    if not text:
+        return None
+    m = INSURANCE_YEARS_PATTERN.search(text)
+    if not m:
+        return None
+    years = int(m.group(1))
+    days = int(m.group(2))
+    if days >= 180:
+        years += 1
+    return years
+
+
+# ============================================================
+# Badge / Layer 判定
+# ============================================================
+
+# ============================================================
+# Badge / Layer 判定
+# ============================================================
+
+def rule_based_badges(cats: dict, badge_relevant_text: str = "") -> set:
+    """100% 離線：依「證照檔名」與 CV 中「學歷／證照／技師」相關段落判定證照代碼，
+    不消耗任何 AI 額度。
+
+    嚴格防呆：學歷等級（碩／博）與管理類證照（品／安／採）只要出現關鍵字即可判定；
+    但技師別／技術士別（水／土／景／乙／甲）必須與「技師／執照／證照／技術士」等
+    執業字樣同段落出現才會判定，避免誤抓專案名稱（如「景觀工程」專案）或純學歷
+    科系（如「土木工程學系」）造成誤頒徽章。
+    """
+    badges = set()
+    if cats.get("4_技師執業執照") or cats.get("5_技師會員證"):
+        badges.add("技")
+
+    filename_text = " ".join(
+        os.path.basename(f) for files in cats.values() for f in files
+    )
+
+    # 學歷等級／管理類證照：關鍵字出現即可，誤判風險低
+    simple_scope = filename_text + " " + (badge_relevant_text or "")
+    simple_keyword_map = {
+        "碩": ["碩士"],
+        "博": ["博士"],
+        "採": ["採購"],
+        "品": ["品質"],
+        "安": ["安全衛生", "勞安"],
+    }
+    for badge, kws in simple_keyword_map.items():
+        if any(kw in simple_scope for kw in kws):
+            badges.add(badge)
+
+    # 技師別／技術士別：需與執業字樣同一行/段落出現，避免誤判
+    discipline_keyword_map = {
+        "水": ["水利"],
+        "土": ["土木"],
+        "景": ["景觀"],
+        "乙": ["乙級"],
+        "甲": ["甲級"],
+    }
+    license_context_keywords = ["技師", "執照", "證照", "证照", "執業", "技術士"]
+    scope_lines = (badge_relevant_text or "").splitlines() + [filename_text]
+    for badge, kws in discipline_keyword_map.items():
+        for line in scope_lines:
+            if any(kw in line for kw in kws) and any(ctx in line for ctx in license_context_keywords):
+                badges.add(badge)
+                break
+
+    return badges
+
+
+def extract_badge_relevant_text(cv_text: str) -> str:
+    """僅擷取 CV 中與「學歷／證照／技師」相關的段落，限縮 Badges 判定範圍，
+    避免掃描到專案名稱等無關內容（例如專案名稱含「景觀」但當事人並非景觀技師）。"""
+    if not cv_text:
+        return ""
+    section_keywords = ["學歷", "學位", "證照", "证照", "技師", "執照", "檢定",
+                        "考試及格", "資格", "訓練合格", "會員證", "技術士"]
+    relevant = []
+    for line in cv_text.splitlines():
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+        if any(kw in line_stripped for kw in section_keywords):
+            relevant.append(line_stripped)
+    return "\n".join(relevant)
+
+
+def merge_and_sort_badges(ai_badges_str: str, rule_badges: set) -> str:
+    """依 BADGE_SORT_ORDER 排序後組成字串。ai_badges_str 保留參數以相容舊呼叫，
+    目前 Badges 已全面改為離線判定，通常傳入空字串即可。"""
+    ai_set = set()
+    if ai_badges_str:
+        for b in re.split(r"[,，、/\s]+", str(ai_badges_str)):
+            b = b.strip()
+            if b:
+                ai_set.add(b)
+    merged = ai_set | rule_badges
+    ordered = [b for b in BADGE_SORT_ORDER if b in merged]
+    extra = [b for b in merged if b not in BADGE_SORT_ORDER]
+    return ",".join(ordered + extra)
+
+
+def determine_layer(role_text: str) -> str:
+    """判斷 Layer，相容「畫／劃」異體字（如：計畫主持人／計劃主持人）。
+    比對順序刻意將較具體的關鍵字（如「副主持人」）放在通用「主持人」之前，
+    避免被較寬鬆的規則搶先命中。"""
+    role_text = str(role_text or "")
+
+    if any(kw in role_text for kw in ["設計負責人", "副計畫主持人", "副計劃主持人"]):
+        return "SubTop"
+    if any(kw in role_text for kw in ["計畫主持人", "計劃主持人", "協同主持人", "代表廠商", "主持人"]):
+        return "Top"
+    if any(kw in role_text for kw in ["計畫顧問", "計劃顧問", "品質督導", "顧問"]):
+        return "Advisor"
+    if any(kw in role_text for kw in ["計畫經理", "計劃經理", "專案經理"]):
+        return "Middle"
+    if any(kw in role_text for kw in ["組長", "隊長"]):
+        return "GroupLeader"
+    if any(kw in role_text for kw in ["協力廠商", "分包"]):
+        return "Subcontractor"
+    return "GroupMember"
+
+
+# ============================================================
+# Phase 1：100% 離線欄位預填（不消耗 API，零失敗保底）
+# ============================================================
+
+BADGE_FULL_NAMES = {
+    "技": "技師", "碩": "碩士", "博": "博士", "品": "品質管理",
+    "安": "勞工安全衛生", "採": "採購專業", "乙": "乙級技術士",
+    "甲": "甲級技術士", "景": "景觀", "土": "土木工程", "水": "水利工程",
+}
+
+DEGREE_PRIORITY_KEYWORDS = ["博士", "碩士", "研究所", "學士", "大學"]
+
+COMPANY_TITLE_LINE_KEYWORDS = ["現職", "現 職", "現任", "服務單位", "現任職務",
+                               "服務機構", "任職公司"]
+COMPANY_HINT_KEYWORDS = ["股份有限公司", "有限公司", "工程顧問"]
+TITLE_HINT_KEYWORDS = ["職稱", "職務"]
+
+# 公司名稱結尾關鍵字（依常見長度排序，用於切分「公司全名」與「職稱」）
+COMPANY_SUFFIX_KEYWORDS = [
+    "股份有限公司", "有限公司", "技師事務所", "建築師事務所", "事務所",
+    "分公司", "公司", "協會", "學會", "基金會",
+]
+
+# 前綴清洗：去除「現職：」「現 職：」「現任：」「-」等雜訊，避免污染 Company 欄位
+COMPANY_TITLE_PREFIX_PATTERN = re.compile(
+    r"^(?:現\s*職|現\s*任|服務單位|服務機構|任職公司)\s*[:：\-－]?\s*"
+)
+# 表頭關鍵字黑名單：這些字樣本身不能被當作 Title/Company 的值
+HEADER_BLACKLIST = {"職稱", "服務單位", "現職", "職務", "公司", "服務機構"}
+
+JOB_DESCRIPTION_TEMPLATES = [
+    (["計畫主持人", "計劃主持人", "主持人"], "負責本專案整體規劃、品質控管、進度督導與跨單位溝通協調"),
+    (["協同主持人"], "協助計畫主持人統籌專案執行，負責跨組別協調與技術審查"),
+    (["計畫顧問", "計劃顧問", "顧問"], "提供專業技術諮詢與審查意見，協助提升專案品質與可行性"),
+    (["品質督導"], "負責專案品質管理制度督導與稽核，確保符合契約與法規要求"),
+    (["設計負責人"], "負責工程設計規劃、技術審查與設計圖說品質把關"),
+    (["計畫經理", "計劃經理", "專案經理"], "負責專案進度管控、資源調度、預算執行與跨部門協調"),
+    (["組長", "隊長"], "負責所屬工作組別之任務分派、技術執行與進度回報"),
+    (["協力廠商", "分包"], "配合本案提供專業技術服務與資源支援"),
+]
+
+# 組別關鍵字 -> 該組別典型工作內容片語，用於讓 JobDescription 依 GroupName 動態變化
+GROUP_NAME_HINTS = [
+    (["現場調查", "現勘"], "辦理現場勘查與基礎資料蒐集"),
+    (["細部設計", "設計"], "執行細部設計與技術規範撰擬"),
+    (["監造", "監督施工"], "辦理工程監造與施工品質查核"),
+    (["測量"], "執行測量作業與圖籍檢核"),
+    (["環境", "生態"], "辦理環境影響評估與生態調查"),
+    (["水理", "水文"], "執行水理水文分析與模擬"),
+    (["行政", "文書"], "辦理專案行政聯繫與文書作業"),
+]
+
+
+def extract_degree_offline(cv_text: str) -> str:
+    """離線正則：依優先序（博士＞碩士＞研究所＞學士＞大學）搜尋 CV 中含學歷
+    關鍵字的段落。"""
+    if not cv_text:
+        return ""
+    lines = [l.strip() for l in cv_text.splitlines() if l.strip()]
+    for kw in DEGREE_PRIORITY_KEYWORDS:
+        for line in lines:
+            if kw in line:
+                return line[:60]
+    return ""
+
+
+def split_company_title(text: str):
+    """依公司名稱結尾關鍵字（如：分公司／股份有限公司／事務所）切分「公司全名」
+    與「職稱」，取結尾關鍵字中「結束位置最晚、且同結束位置下最長」者，避免公司
+    名稱中途出現的「工程顧問」等詞被誤判為結尾。"""
+    text = text.strip()
+    if not text:
+        return "", ""
+    window = text[:40]
+    best_end, best_kw = -1, None
+    for kw in COMPANY_SUFFIX_KEYWORDS:
+        idx = window.find(kw)
+        if idx == -1:
+            continue
+        end = idx + len(kw)
+        if end > best_end or (end == best_end and (best_kw is None or len(kw) > len(best_kw))):
+            best_end, best_kw = end, kw
+
+    if best_end != -1:
+        company = text[:best_end].strip()
+        title = text[best_end:].strip()
+        title = title.strip(" ,，、-:：")
+        return company, title
+
+    # 找不到公司關鍵字：以第一個空白切分（公司名稱 職稱）
+    parts = text.split(None, 1)
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return text, ""
+
+
+def extract_company_title_offline(cv_text: str):
+    """離線正則：搜尋「現職／服務單位／職稱」等關鍵字段落，去除「現職：」
+    「現 職：」等前綴後，精準切分出 Company（公司全名）與 Title（實際職稱），
+    並禁止把「職稱」「服務單位」等表頭字樣本身填入欄位。"""
+    if not cv_text:
+        return "", ""
+    lines = [l.strip() for l in cv_text.splitlines() if l.strip()]
+    company, title = "", ""
+
+    for line in lines:
+        if any(kw in line for kw in COMPANY_TITLE_LINE_KEYWORDS):
+            cleaned = COMPANY_TITLE_PREFIX_PATTERN.sub("", line).strip(" -－")
+            if not cleaned or cleaned in HEADER_BLACKLIST:
+                continue
+            c, t = split_company_title(cleaned)
+            if c and c not in HEADER_BLACKLIST and not company:
+                company = c
+            if t and t not in HEADER_BLACKLIST and not title:
+                title = t
+
+    if not company:
+        for line in lines:
+            if any(kw in line for kw in COMPANY_HINT_KEYWORDS):
+                cleaned = COMPANY_TITLE_PREFIX_PATTERN.sub("", line).strip()
+                c, _ = split_company_title(cleaned)
+                if c and c not in HEADER_BLACKLIST:
+                    company = c
+                    break
+
+    if not title:
+        for line in lines:
+            if any(kw in line for kw in TITLE_HINT_KEYWORDS):
+                parts = re.split(r"[:：]", line, maxsplit=1)
+                if len(parts) > 1 and parts[1].strip():
+                    candidate = parts[1].strip()[:20]
+                    if candidate not in HEADER_BLACKLIST:
+                        title = candidate
+                        break
+
+    return company, title
+
+
+BULLET_NOISE_PATTERN = re.compile(r"[•▪◆■●○\uf06f\uf0b7\u2022\u25cf\*]+")
+NON_TEXT_NOISE_PATTERN = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+
+
+def clean_expertise_text(raw: str) -> str:
+    """清除項目符號、控制字元／亂碼與非常見標點，只保留中英文數字與常見分隔符。"""
+    if not raw:
+        return ""
+    text = BULLET_NOISE_PATTERN.sub(" ", raw)
+    text = NON_TEXT_NOISE_PATTERN.sub(" ", text)
+    text = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9、,，/\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_expertise_offline(cv_text: str, badges: set) -> str:
+    """離線正則：優先從 CV「專長」段落擷取關鍵字，清除亂碼／項目符號後，
+    僅保留 2~10 字的精簡詞彙（過濾長句與雜訊），統一以「/」分隔輸出 4~6 項；
+    找不到則以已判定的證照代碼展開為專長描述，確保欄位不為空。"""
+    if cv_text:
+        for kw in ["專長", "专长", "專業領域", "专业领域"]:
+            idx = cv_text.find(kw)
+            if idx != -1:
+                segment = cv_text[idx: idx + 150]
+                parts = re.split(r"[:：]", segment, maxsplit=1)
+                value = parts[1] if len(parts) > 1 else parts[0]
+                value = clean_expertise_text(value)
+                tokens = [t.strip() for t in re.split(r"[、,，/\s]+", value) if t.strip()]
+                tokens = [t for t in tokens if 2 <= len(t) <= 10]
+                if len(tokens) >= 2:
+                    return "/".join(tokens[:6])
+
+    if badges:
+        ordered = [b for b in BADGE_SORT_ORDER if b in badges]
+        names = [BADGE_FULL_NAMES.get(b, b) for b in ordered]
+        if names:
+            return "/".join(names[:6])
+    return ""
+
+
+def extract_representative_projects(cv_text: str, max_n: int = 2) -> str:
+    """離線正則：從 CV 中挑出 1~2 項含年份且含「專案/計畫/工程/案」字樣的
+    代表性經歷，清洗雜訊後回傳精簡片語（供 BioNarrative 與 AI 草稿共用）。"""
+    if not cv_text:
+        return ""
+    candidates = []
+    for line in cv_text.splitlines():
+        line = line.strip()
+        if not line or len(line) > 60:
+            continue
+        if re.search(r"\d{2,4}\s*年", line) and any(k in line for k in ["專案", "計畫", "計劃", "工程", "案"]):
+            cleaned = re.sub(r"^\d{2,4}\s*年\s*", "", line)
+            cleaned = clean_expertise_text(cleaned)
+            if cleaned:
+                candidates.append(cleaned[:30])
+
+    seen, uniq = set(), []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    return "、".join(uniq[:max_n])
+
+
+def build_fallback_bio(name: str, degree: str, company: str, title: str, years,
+                        project_snippet: str, expertise: str) -> str:
+    """BioNarrative 保底樣板：比照標案範本風格採四段式結構——
+    ①學歷與現職 ②代表性經歷 ③核心專長 ④履約效益，確保即使離線也具備說服力，
+    不會是單薄的單句罐頭語句。"""
+    degree_part = degree or "相關專業"
+    company_part = company or "本公司"
+    title_part = title or "工程顧問"
+    years_part = f"{years}年" if years else "多年"
+
+    part1 = f"{name}君具{years_part}相關工程資歷，現任{company_part}{title_part}，具備{degree_part}學歷。"
+    if project_snippet:
+        part2 = f"曾參與{project_snippet}等代表性專案，實務經驗豐富。"
+    else:
+        part2 = "曾參與多項公共工程規劃、設計與監造專案，實務經驗豐富。"
+    part3 = f"核心專長涵蓋{expertise}。" if expertise else "核心專長涵蓋水利與工程專案管理。"
+    part4 = "具備良好團隊協調與品質控管能力，能確保本案高品質履約。"
+
+    return part1 + part2 + part3 + part4
+
+
+def build_fallback_job_description(role_text: str, group_name: str = "") -> str:
+    """JobDescription 保底樣板：依團隊職務（Role）關鍵字對應標準工作內容，
+    並結合部門/組別（GroupName）動態調整敘述，避免所有組員/組長套用完全
+    相同的句子。"""
+    role_text = str(role_text or "").strip()
+    group_name = str(group_name or "").strip()
+    if group_name in ("", "—", "nan", "None"):
+        group_name = ""
+
+    base = None
+    for kws, desc in JOB_DESCRIPTION_TEMPLATES:
+        if any(kw in role_text for kw in kws):
+            base = desc
+            break
+    if base is None:
+        base = "負責所屬工作項目之執行、協調與品質把關，配合專案進度完成各階段任務"
+
+    group_hint = ""
+    if group_name:
+        for kws, hint in GROUP_NAME_HINTS:
+            if any(kw in group_name for kw in kws):
+                group_hint = hint
+                break
+
+    if group_name and group_hint:
+        return f"於{group_name}擔任{role_text or '團隊成員'}，{group_hint}，{base}。"
+    if group_name:
+        return f"於{group_name}擔任{role_text or '團隊成員'}，{base}。"
+    return base + "。"
+
+
+def build_cv_draft(name: str, role: str, group_name: str, cv_text: str, degree: str,
+                    company: str, title: str, years, expertise: str, project_snippet: str) -> str:
+    """從「完整」CV 全文以正則/簡易規則萃取精簡結構化摘要草稿，供送交 Gemini
+    潤飾使用。草稿本身字數極短，因此不再需要對原始 CV 全文做硬性截斷。"""
+    return (
+        f"姓名：{name}\n"
+        f"團隊職務：{role}\n"
+        f"所屬組別：{group_name or '未知'}\n"
+        f"最高學歷：{degree or '未知'}\n"
+        f"現職：{company or '未知'} {title or ''}\n"
+        f"年資：{years if years else '未知'} 年\n"
+        f"代表性經歷：{project_snippet or '（CV中未偵測到明確專案年份/名稱段落）'}\n"
+        f"專長關鍵字：{expertise or '未知'}"
+    )
+
+
+# ============================================================
+# Phase 2：Gemini AI 摘要潤飾（多 API Key 輪詢 + 模型自動退避）
+# ============================================================
+
+def build_model_chain(selected_model: str) -> list:
+    chain = [selected_model] + DEFAULT_MODEL_CHAIN
+    seen = []
+    for m in chain:
+        if m and m not in seen:
+            seen.append(m)
+    return seen
+
+
+def summarize_ai_error(e: Exception) -> str:
+    """將底層例外（可能是很長的 JSON/HTTP 錯誤內容）轉換為簡短、乾淨的人類可讀
+    原因，避免在 Streamlit 介面上裸露大段原始錯誤堆疊，維持 UI 整潔。"""
+    msg = str(e)
+    upper = msg.upper()
+    if "429" in msg or "RESOURCE_EXHAUSTED" in upper or "QUOTA" in upper or "RATE LIMIT" in upper.replace("_", " "):
+        return "API 額度已達上限（429）"
+    if "503" in msg or "UNAVAILABLE" in upper or "OVERLOADED" in upper.replace(" ", ""):
+        return "AI 服務暫時過載（503）"
+    if "TIMEOUT" in upper or "TIMED OUT" in upper:
+        return "請求逾時"
+    if "404" in msg or "NOT_FOUND" in upper:
+        return "模型暫時無法使用"
+    if "API KEY" in upper or "PERMISSION" in upper or "UNAUTHENTICATED" in upper:
+        return "API Key 驗證失敗"
+    return "AI 服務暫時無法使用"
+
+
+def gemini_polish_summary(api_keys: list, model_chain: list, name: str, role: str, draft_text: str):
+    """呼叫 Gemini，將 Phase 1 離線產出的「精簡結構化摘要草稿」潤飾為正式的
+    BioNarrative 與 JobDescription。**僅**負責這兩個欄位——Title/Company/
+    Degree/Expertise/YearsOfExp/Badges 全部已由 Phase 1 離線判定完成，不再
+    經過 AI，也因此不會受 429 影響。
+
+    由於送出的是精簡草稿（而非原始 CV 全文），Token 用量極低，不需要再對
+    CV 全文做任何硬性截斷即可處理任意頁數的長篇履歷。
+
+    多組 API Key 輪詢：外層依序嘗試每個候選模型，內層依序嘗試每一組
+    API Key；一旦遇到 429／配額錯誤即「立即」切換下一組 Key（不等待），
+    503／服務過載才進行指數退避重試。"""
+    if not api_keys:
+        raise RuntimeError("未提供任何可用的 Gemini API Key")
+
+    prompt = f"""你是專業的標案人員履歷編輯，比照政府標案「服務建議書」附錄人員簡歷的
+撰寫風格。以下是根據 CV 離線預先萃取出的精簡結構化摘要草稿，請將其潤飾為更專業、
+具評審說服力的正式文字，並嚴格以 JSON 格式輸出（僅輸出 JSON，不要有任何其他文字、
+不要使用 markdown code block）：
+
+{{
+  "BioNarrative": "200字以內，須採四段式結構撰寫（文字需連貫，不要條列）：①學歷與現職（含最高學歷、現職公司與職稱）②代表性經歷（從草稿的代表性經歷中，精準點出1~2項重點專案名稱）③核心專長（涵蓋相關工程領域關鍵字）④履約效益（強調團隊協調與品質控管能力，能確保本案高品質履約）",
+  "JobDescription": "50字以內，須同時依據此人擔任的團隊職務（{role}）與所屬組別，具體歸納其在本專案中擬任的工作內容，不可套用與其他人完全相同的罐頭句子"
+}}
+
+人員姓名：{name}
+
+離線預萃取草稿如下（含姓名/團隊職務/所屬組別/最高學歷/現職/年資/代表性經歷/專長）：
+---
+{draft_text}
+---
+"""
+    last_err = None
+    for model in model_chain:
+        for key_idx, api_key in enumerate(api_keys):
+            try:
+                client = genai.Client(api_key=api_key)
+            except Exception as e:
+                last_err = e
+                continue
+
+            max_attempts = 2  # 503 情境下：1次初始嘗試 + 最多1次退避重試
+            for attempt in range(max_attempts):
+                try:
+                    resp = client.models.generate_content(model=model, contents=prompt)
+                    raw = (resp.text or "").strip()
+                    raw = re.sub(r"^```json\s*|\s*```$", "", raw, flags=re.MULTILINE).strip("`").strip()
+                    data = json.loads(raw)
+                    return data, model, key_idx
+                except json.JSONDecodeError as e:
+                    last_err = e
+                    break  # 解析失敗，換下一組 API Key
+                except Exception as e:
+                    msg = str(e)
+                    is_rate_limit = (
+                        "429" in msg or "RESOURCE_EXHAUSTED" in msg.upper()
+                        or "rate limit" in msg.lower() or "quota" in msg.lower()
+                    )
+                    if is_rate_limit:
+                        last_err = e
+                        break  # 429：立即切換下一組 API Key，不等待、不重試同一把
+                    if "404" in msg or "NOT_FOUND" in msg.upper():
+                        last_err = e
+                        break  # 換下一組 Key／模型
+                    if "503" in msg or "UNAVAILABLE" in msg.upper() or "overloaded" in msg.lower():
+                        last_err = e
+                        if attempt < max_attempts - 1:
+                            time.sleep((2 ** attempt) + random.random())
+                            continue
+                        break
+                    last_err = e
+                    break
+    raise RuntimeError(f"所有 API Key／模型組合皆呼叫失敗：{last_err}")
+
+
+# ============================================================
+# PDF 合併
+# ============================================================
+
+def merge_person_pdfs(ordered_names: list, files_by_person: dict, workdir: str) -> bytes:
+    if PdfWriter is None:
+        raise RuntimeError("pypdf 套件未安裝，無法合併 PDF")
+
+    writer = PdfWriter()
+    page_cursor = 0
+
+    for person in ordered_names:
+        cats = files_by_person.get(person, {})
+        person_start_page = page_cursor
+        any_page = False
+
+        for cat in CATEGORY_ORDER:
+            filelist = sorted(cats.get(cat, []))
+            for fp in filelist:
+                pdf_path = convert_to_pdf(fp, workdir)
+                if not pdf_path:
+                    continue
+                try:
+                    reader = PdfReader(pdf_path)
+                    for page in reader.pages:
+                        writer.add_page(page)
+                        page_cursor += 1
+                        any_page = True
+                except Exception:
+                    continue
+
+        if any_page:
+            try:
+                writer.add_outline_item(person, person_start_page)
+            except Exception:
+                pass
+
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# ============================================================
+# Excel 輸出
+# ============================================================
+
+def build_template_excel(df: pd.DataFrame) -> bytes:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Staffing"
+    wb.calculation.fullCalcOnLoad = True
+
+    header_font = Font(name="微軟正黑體", bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
+    body_font = Font(name="微軟正黑體")
+
+    for col_idx, col_name in enumerate(TEMPLATE_COLUMNS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    safe_df = df.copy()
+    for col in TEMPLATE_COLUMNS:
+        if col not in safe_df.columns:
+            safe_df[col] = ""
+    safe_df = safe_df[TEMPLATE_COLUMNS]
+
+    for row_idx, row in enumerate(safe_df.itertuples(index=False), start=2):
+        for col_idx, value in enumerate(row, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.font = body_font
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+    widths = [10, 14, 12, 10, 14, 20, 10, 16, 10, 22, 28, 28, 45]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = "A2"
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def build_license_report_excel(df_license: pd.DataFrame) -> bytes:
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df_license.to_excel(writer, index=False, sheet_name="證照效期檢核")
+        wb = writer.book
+        wb.calculation.fullCalcOnLoad = True
+        ws = writer.sheets["證照效期檢核"]
+
+        header_font = Font(name="微軟正黑體", bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
+        for cell in ws[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+
+        red_fill = PatternFill(start_color="FADBD8", end_color="FADBD8", fill_type="solid")
+        yellow_fill = PatternFill(start_color="FCF3CF", end_color="FCF3CF", fill_type="solid")
+
+        status_col_idx = None
+        for idx, cell in enumerate(ws[1], start=1):
+            if cell.value == "狀態":
+                status_col_idx = idx
+                break
+
+        if status_col_idx and ws.max_row >= 2:
+            for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+                val = row[status_col_idx - 1].value
+                if val and "已過期" in str(val):
+                    for c in row:
+                        c.fill = red_fill
+                elif val and "即將過期" in str(val):
+                    for c in row:
+                        c.fill = yellow_fill
+
+        for column_cells in ws.columns:
+            length = max((len(str(c.value)) if c.value else 0) for c in column_cells)
+            col_letter = column_cells[0].column_letter
+            ws.column_dimensions[col_letter].width = min(max(length + 2, 10), 40)
+
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+# ============================================================
+# 主流程（Phase 1：掃描與比對 / Phase 2：確認後執行）
+# ============================================================
+
+def scan_and_match_files(excel_file, zip_file) -> dict:
+    """Phase 1：讀取人員名單、解壓 ZIP，並以三段式雙軌配對機制為每個檔案
+    產生高/中/低信心度配對結果。不執行 AI 呼叫、PDF 合併等重工作，
+    以便使用者能先確認/修正配對結果。"""
+    df_people = pd.read_excel(excel_file)
+    required_cols = ["順序", "姓名", "部門", "團隊職務"]
+    missing = [c for c in required_cols if c not in df_people.columns]
+    if missing:
+        raise ValueError(f"人員名單 Excel 缺少必要欄位：{'、'.join(missing)}")
+    if "英文姓名" not in df_people.columns:
+        df_people["英文姓名"] = ""
+
+    df_people = df_people.sort_values("順序").reset_index(drop=True)
+    names = [str(n) for n in df_people["姓名"].tolist()]
+    aliases = build_alias_list(df_people)
+
+    workdir = tempfile.mkdtemp(prefix="staffing_")
+    extract_dir = os.path.join(workdir, "extracted")
+    convert_workdir = os.path.join(workdir, "converted")
+    os.makedirs(extract_dir, exist_ok=True)
+    os.makedirs(convert_workdir, exist_ok=True)
+
+    with zipfile.ZipFile(zip_file) as z:
+        z.extractall(extract_dir)
+
+    all_files = []
+    for root, _dirs, files in os.walk(extract_dir):
+        root_lower = root.lower()
+        if any(token.lower() in root_lower for token in EXCLUDE_DIR_TOKENS):
+            continue
+        for f in files:
+            if f.startswith("."):
+                continue
+            all_files.append(os.path.join(root, f))
+
+    high_matches = {}      # filepath -> (person, score, matched_alias_text)
+    pending_matches = []   # 中信心度，待使用者確認
+    low_matches = []       # 低信心度，待使用者手動指定
+
+    for fp in all_files:
+        fname = os.path.basename(fp)
+        ranked = match_person_candidates(fname, aliases)
+        if ranked:
+            top_person, top_score, top_alias = ranked[0]
+        else:
+            top_person, top_score, top_alias = None, 0.0, ""
+
+        if top_score >= HIGH_CONFIDENCE_THRESHOLD:
+            high_matches[fp] = (top_person, top_score, top_alias)
+        elif top_score >= MEDIUM_CONFIDENCE_THRESHOLD:
+            pending_matches.append({
+                "file": fp, "fname": fname,
+                "candidates": ranked[:5], "default": top_person,
+            })
+        else:
+            low_matches.append({
+                "file": fp, "fname": fname, "candidates": ranked[:5],
+            })
+
+    return {
+        "df_people": df_people,
+        "names": names,
+        "workdir": workdir,
+        "extract_dir": extract_dir,
+        "convert_workdir": convert_workdir,
+        "high_matches": high_matches,
+        "pending_matches": pending_matches,
+        "low_matches": low_matches,
+    }
+
+
+def finalize_processing(scan: dict, pending_selection: dict, low_selection: dict,
+                         api_keys: list, model_name: str) -> dict:
+    """Phase 2：整合使用者確認後的人員配對結果，以「內文導向」對每個檔案
+    進行分類與 OCR 掃描（含進度條），執行證照效期檢核、AI 履歷結構化萃取，
+    並產出合併附錄 PDF。"""
+    df_people = scan["df_people"]
+    names = scan["names"]
+    convert_workdir = scan["convert_workdir"]
+
+    final_mapping = {fp: info[0] for fp, info in scan["high_matches"].items()}
+    for item in scan["pending_matches"]:
+        person = pending_selection.get(item["file"])
+        if person:
+            final_mapping[item["file"]] = person
+
+    still_unmatched = []
+    for item in scan["low_matches"]:
+        person = low_selection.get(item["file"])
+        if person:
+            final_mapping[item["file"]] = person
+        else:
+            still_unmatched.append({"file": item["file"], "fname": item["fname"]})
+
+    # ------------------------------------------------------------
+    # Phase 2a：內文導向分類 + OCR 掃描（含動態進度條）
+    # ------------------------------------------------------------
+    files_by_person = {}
+    license_rows = []
+    insurance_years_by_person = {}  # 姓名 -> 離線解析出的投保年資（優先權高於 AI）
+
+    file_items = list(final_mapping.items())
+    total_files = max(len(file_items), 1)
+    ocr_status = st.status("正在進行內文與 OCR 掃描...", expanded=True)
+    ocr_progress = st.progress(0.0)
+
+    for idx, (fp, person) in enumerate(file_items, start=1):
+        fname = os.path.basename(fp)
+        ocr_status.write(f"正在進行內文與 OCR 掃描：{fname} ({idx}/{total_files})")
+        ocr_progress.progress(idx / total_files)
+
+        category, text = classify_file_content(fp, convert_workdir)
+        files_by_person.setdefault(person, {}).setdefault(category, []).append(fp)
+
+        if category in ("4_技師執業執照", "5_技師會員證"):
+            check = parse_license_expiry(category, text or "")
+            license_rows.append({
+                "姓名": person,
+                "文件類別": "技師執業執照" if category == "4_技師執業執照" else "技師公會會員證",
+                "檔名": fname,
+                **check,
+            })
+
+        if category == "6_投保證明":
+            # 完全離線解析，不消耗任何 AI 額度；同一人若有多筆投保證明，取年資較大者
+            offline_years = parse_insurance_years(text or "")
+            if offline_years is not None:
+                if person not in insurance_years_by_person or offline_years > insurance_years_by_person[person]:
+                    insurance_years_by_person[person] = offline_years
+
+    ocr_progress.progress(1.0)
+    ocr_progress.empty()
+    ocr_status.update(label=f"內文與 OCR 掃描完成（共 {total_files} 個檔案）", state="complete")
+
+    # ------------------------------------------------------------
+    # Phase 2b：Phase 1 離線預填（100% 保底）+ Gemini AI 摘要潤飾（無縫降級）
+    # ------------------------------------------------------------
+    model_chain = build_model_chain(model_name)
+    ai_available = bool(api_keys) and GENAI_AVAILABLE
+
+    staffing_rows = []
+    no_cv_people = []
+    diagnostics = {}  # 姓名 -> {"status", "reason", "files_by_category"}
+
+    total = max(len(df_people), 1)
+    progress = st.progress(0.0, text="開始進行離線預填與 AI 摘要潤飾...")
+
+    for i, prow in df_people.iterrows():
+        name = str(prow["姓名"])
+        role = str(prow.get("團隊職務", "") or "")
+        group = str(prow.get("部門", "") or "")
+        progress.progress(i / total, text=f"處理中：{name}")
+
+        cats = files_by_person.get(name, {})
+        files_by_category_named = {
+            cat: [os.path.basename(f) for f in files] for cat, files in cats.items()
+        }
+
+        # CV 文字擷取：PDF（含大寫 .PDF）與 Word（含大寫 .DOC/.DOCX）皆支援，
+        # 讀取「完整」全文，不做任何頁數/字數截斷
+        cv_files = cats.get("1_CV", [])
+        cv_text = extract_cv_text(cv_files[0], convert_workdir) if cv_files else ""
+        if not cv_files:
+            no_cv_people.append(name)
+
+        # ---------- Phase 1：100% 離線預填（零 API 消耗，零失敗）----------
+        badge_relevant_text = extract_badge_relevant_text(cv_text)
+        badge_hints = rule_based_badges(cats, badge_relevant_text)
+        degree_offline = extract_degree_offline(cv_text)
+        company_offline, title_offline = extract_company_title_offline(cv_text)
+        expertise_offline = extract_expertise_offline(cv_text, badge_hints)
+        project_snippet = extract_representative_projects(cv_text, max_n=2)
+        years_final = insurance_years_by_person.get(name, 0)  # 無投保證明則為 0
+
+        bio_fallback = build_fallback_bio(name, degree_offline, company_offline, title_offline,
+                                          years_final, project_snippet, expertise_offline)
+        job_fallback = build_fallback_job_description(role, group)
+
+        # 離線基準資料：無論 AI 是否可用，最終欄位都以此為底，永不留空/永不出現佔位字樣
+        final_data = {
+            "Title": title_offline,
+            "Company": company_offline,
+            "Degree": degree_offline,
+            "Expertise": expertise_offline,
+            "JobDescription": job_fallback,
+            "BioNarrative": bio_fallback,
+        }
+
+        diag_status = None
+        diag_reason = ""
+
+        if not cv_files:
+            diag_status = "🔴 缺少 CV 檔案"
+            diag_reason = "ZIP 內未比對到任何 CV 檔案，已套用通用樣板保底"
+        elif not cv_text.strip():
+            diag_status = "🟡 資料待補"
+            diag_reason = "CV 檔案無法擷取到文字內容（可能為純掃描影像，OCR 失敗），已套用樣板保底"
+            st.warning(f"⚠️ 「{name}」的 CV 檔案無法擷取到文字內容（可能為純掃描影像），"
+                       "已套用樣板保底，可視需要改由手動填寫或確認 OCR 環境。")
+        elif not ai_available:
+            diag_status = "🟡 資料待補"
+            diag_reason = "未提供可用的 Gemini API Key，已套用離線草稿保底（未經 AI 潤飾）"
+        else:
+            # ---------- Phase 2：以精簡草稿送 AI 潤飾 BioNarrative／JobDescription ----------
+            draft = build_cv_draft(name, role, group, cv_text, degree_offline, company_offline,
+                                    title_offline, years_final, expertise_offline, project_snippet)
+            try:
+                ai_data, _used_model, _key_idx = gemini_polish_summary(
+                    api_keys, model_chain, name, role, draft
+                )
+                if ai_data.get("BioNarrative"):
+                    final_data["BioNarrative"] = ai_data["BioNarrative"]
+                if ai_data.get("JobDescription"):
+                    final_data["JobDescription"] = ai_data["JobDescription"]
+                diag_status = "🟢 完整解析"
+            except Exception as e:
+                short_reason = summarize_ai_error(e)
+                st.warning(f"⚠️ 「{name}」的 AI 潤飾暫時無法使用（{short_reason}），"
+                           "已無縫切換至高品質離線精準生成模式，Excel 欄位依然完整。")
+                diag_status = "🟡 資料待補"
+                diag_reason = f"AI 潤飾暫時無法使用（{short_reason}），已套用離線草稿保底"
+            finally:
+                # 每位人員的 AI 呼叫之間加入固定延遲，降低 429 (Rate Limit) 風險
+                time.sleep(random.uniform(1.0, 1.5))
+
+        diagnostics[name] = {
+            "status": diag_status,
+            "reason": diag_reason,
+            "files_by_category": files_by_category_named,
+        }
+
+        layer = determine_layer(role)
+        badges_final = merge_and_sort_badges("", badge_hints)  # Badges 已 100% 離線判定
+
+        staffing_rows.append({
+            "Layer": layer,
+            "Role": role,
+            "GroupName": group if group and group.lower() != "nan" else "—",
+            "Name": name,
+            "Title": final_data["Title"],
+            "Company": final_data["Company"],
+            "Badges": badges_final,
+            "PhotoName": f"{name}.jpg",
+            "YearsOfExp": years_final,
+            "Degree": final_data["Degree"],
+            "JobDescription": final_data["JobDescription"],
+            "Expertise": final_data["Expertise"],
+            "BioNarrative": final_data["BioNarrative"],
+        })
+
+    progress.progress(1.0, text="完成")
+    progress.empty()
+
+    if no_cv_people:
+        st.warning("⚠️ 以下人員找不到 CV 檔案，已套用通用樣板保底，建議手動補充精確資訊：" +
+                   "、".join(no_cv_people))
+    if not api_keys:
+        st.info("ℹ️ 未提供 Gemini API Key，BioNarrative／JobDescription 將維持離線草稿版本"
+                "（未經 AI 潤飾），Title/Company/Degree/Expertise 等欄位仍為 100% 離線判定結果。")
+    elif not GENAI_AVAILABLE:
+        st.warning("⚠️ 尚未安裝 google-genai 套件，AI 潤飾功能無法使用，已全數採用離線草稿保底。")
+
+    df_staffing = pd.DataFrame(staffing_rows, columns=TEMPLATE_COLUMNS)
+    df_license = pd.DataFrame(
+        license_rows,
+        columns=["姓名", "文件類別", "檔名", "狀態", "起始日", "截止日", "備註"],
+    )
+
+    merged_pdf_bytes = b""
+    try:
+        merged_pdf_bytes = merge_person_pdfs(names, files_by_person, convert_workdir)
+    except Exception as e:
+        st.error(f"附錄 PDF 合併發生錯誤：{e}")
+
+    return {
+        "df_staffing": df_staffing,
+        "df_license": df_license,
+        "merged_pdf": merged_pdf_bytes,
+        "unmatched_files": still_unmatched,
+        "diagnostics": diagnostics,
+    }
+
+
+# ============================================================
+# Tab2 UI 輔助函式：Mapping 診斷呈現
+# ============================================================
+
+def format_mapping_line(name: str, diag: dict) -> str:
+    """組成單一人員的檔案配對摘要行，CV 一律顯示（無則標示「無」），
+    其餘分類僅在有檔案時列出。"""
+    files_by_cat = diag.get("files_by_category", {})
+    cv_files = files_by_cat.get("1_CV", [])
+    parts = ["[CV] " + ("、".join(cv_files) if cv_files else "無")]
+    for cat in ["2_學歷", "3_證照", "4_技師執業執照", "5_技師會員證", "6_投保證明"]:
+        files = files_by_cat.get(cat, [])
+        if files:
+            parts.append(f"[{CATEGORY_LABELS[cat]}] " + "、".join(files))
+    return f"**{name}**：" + "｜".join(parts) + f"（狀態：{diag.get('status', '')}）"
+
+
+def run_finalize_and_store(scan: dict, api_keys: list, model_name: str) -> None:
+    """執行 Phase 2 並將結果寫回 st.session_state，供 Step 2 按鈕與
+    tab2 的「套用修正並重新處理」按鈕共用。"""
+    with st.spinner("處理中，請稍候（含 PDF 轉檔、效期檢核與 AI 呼叫，可能需數分鐘）..."):
+        try:
+            result = finalize_processing(
+                scan, st.session_state.pending_selection, st.session_state.low_selection,
+                api_keys, model_name,
+            )
+            st.session_state.df_staffing = result["df_staffing"]
+            st.session_state.df_license = result["df_license"]
+            st.session_state.merged_pdf_bytes = result["merged_pdf"]
+            st.session_state.unmatched_files = result["unmatched_files"]
+            st.session_state.diagnostics = result["diagnostics"]
+            st.success("✅ 處理完成！請於下方分頁查看結果並下載檔案。")
+        except Exception as e:
+            st.error(f"❌ 處理失敗：{e}")
+
+
+# ============================================================
+# Streamlit 介面
+# ============================================================
+
+st.set_page_config(page_title="備標人員附錄整理、證照檢核與 CV 結構化轉檔系統", layout="wide")
+
+st.title("📋 備標人員附錄整理、證照檢核與 CV 結構化轉檔系統")
+st.caption("上傳人員名單 Excel 與證明文件 ZIP，自動排序合併附錄 PDF、檢核證照效期，"
+           "並以 AI 產出可直接餵給組織圖產生器的 Template_Staffing.xlsx")
+
+for key, default in [
+    ("scan", None),
+    ("pending_selection", {}),
+    ("low_selection", {}),
+    ("df_staffing", None),
+    ("df_license", None),
+    ("merged_pdf_bytes", None),
+    ("unmatched_files", []),
+    ("diagnostics", {}),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+with st.sidebar:
+    st.header("① 檔案上傳")
+    excel_file = st.file_uploader(
+        "人員名單 Excel（需含：順序／姓名／部門／團隊職務，建議另含「英文姓名」欄）",
+        type=["xlsx"],
+    )
+    zip_file = st.file_uploader("人員證明文件 ZIP（CV / 學歷 / 證照 / 投保等 PDF・Word）", type=["zip"])
+
+    st.header("② Gemini AI 設定")
+    secrets_key = None
+    try:
+        secrets_key = st.secrets.get("GEMINI_API_KEY", None)
+    except Exception:
+        secrets_key = None
+
+    if secrets_key:
+        st.success("🔒 已從 Streamlit Secrets 自動讀取 API Key（可於下方欄位追加更多組，"
+                   "以逗號分隔，提升 429 輪詢容量）")
+
+    api_keys_raw = st.text_input(
+        "Gemini API Key（可輸入多組，以逗號分隔，例如 Key1, Key2；"
+        "遇到 429 配額錯誤會自動輪詢下一組）",
+        value=(secrets_key or ""), type="password",
+    )
+    api_keys = [k.strip() for k in re.split(r"[,，]", api_keys_raw) if k.strip()]
+    if len(api_keys) > 1:
+        st.caption(f"已設定 {len(api_keys)} 組 API Key，將依序輪詢使用。")
+
+    model_options = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "自訂模型"]
+    selected_choice = st.selectbox("Gemini 模型選取", model_options)
+    if selected_choice == "自訂模型":
+        selected_model = st.text_input("自訂 Model ID", value="gemini-2.5-flash")
+    else:
+        selected_model = selected_choice
+
+    if not GENAI_AVAILABLE:
+        st.warning("⚠️ 尚未安裝 google-genai 套件，AI 摘要潤飾功能將無法使用"
+                   "（Title/Company/Degree/Badges/YearsOfExp 等欄位仍會 100% 離線產出）。")
+
+    st.divider()
+    scan_btn = st.button("① 掃描並比對人員檔案", use_container_width=True)
+
+# ------------------------------------------------------------
+# Step 1：掃描並比對（三段式雙軌配對機制）
+# ------------------------------------------------------------
+
+if scan_btn:
+    if not excel_file or not zip_file:
+        st.error("請先於左側上傳人員名單 Excel 與證明文件 ZIP。")
+    else:
+        with st.spinner("掃描檔案並比對人員中，請稍候..."):
+            try:
+                scan = scan_and_match_files(excel_file, zip_file)
+                st.session_state.scan = scan
+                st.session_state.pending_selection = {
+                    item["file"]: item["default"] for item in scan["pending_matches"]
+                }
+                st.session_state.low_selection = {
+                    item["file"]: None for item in scan["low_matches"]
+                }
+                # 重置尚未產生的最終結果
+                st.session_state.df_staffing = None
+                st.session_state.df_license = None
+                st.session_state.merged_pdf_bytes = None
+                st.session_state.unmatched_files = []
+                st.session_state.diagnostics = {}
+                st.success(
+                    f"✅ 掃描完成：高信心度自動配對 {len(scan['high_matches'])} 個檔案、"
+                    f"待確認 {len(scan['pending_matches'])} 個、"
+                    f"低信心度待手動指定 {len(scan['low_matches'])} 個。"
+                )
+            except Exception as e:
+                st.error(f"❌ 掃描失敗：{e}")
+
+scan = st.session_state.scan
+
+if scan is not None:
+    st.subheader("Step 1｜檔案配對結果")
+
+    with st.expander(f"✅ 已自動配對（高信心度 ≥ {HIGH_CONFIDENCE_THRESHOLD:.0%}）："
+                      f"{len(scan['high_matches'])} 個檔案", expanded=False):
+        if scan["high_matches"]:
+            high_rows = [
+                {
+                    "檔案": os.path.basename(fp),
+                    "配對依據": alias_text,
+                    "配對人員": person,
+                    "信心度": f"{score:.0%}",
+                }
+                for fp, (person, score, alias_text) in scan["high_matches"].items()
+            ]
+            st.dataframe(pd.DataFrame(high_rows), use_container_width=True, hide_index=True)
+            for row in high_rows:
+                st.caption(f"已自動配對：{row['配對依據']} → {row['配對人員']}")
+        else:
+            st.write("（無）")
+
+    if scan["pending_matches"]:
+        st.markdown(f"### ⚠️ 待確認配對（中信心度 {MEDIUM_CONFIDENCE_THRESHOLD:.0%}～"
+                    f"{HIGH_CONFIDENCE_THRESHOLD:.0%}）：{len(scan['pending_matches'])} 個檔案")
+        st.caption("已預設選中最高機率的候選人員，請確認或修正後再進行 Step 2。")
+        for item in scan["pending_matches"]:
+            option_names = [c[0] for c in item["candidates"]]
+            for n in scan["names"]:
+                if n not in option_names:
+                    option_names.append(n)
+            options = ["— 略過此檔案 —"] + option_names
+            default_person = st.session_state.pending_selection.get(item["file"], item["default"])
+            default_idx = options.index(default_person) if default_person in options else 1
+            score_hint = "、".join(f"{p}({s:.0%})" for p, s, _ in item["candidates"][:3])
+            choice = st.selectbox(
+                f"⚠️ {item['fname']}　－　候選：{score_hint}",
+                options, index=default_idx, key=f"pending_{item['file']}",
+            )
+            st.session_state.pending_selection[item["file"]] = (
+                None if choice == "— 略過此檔案 —" else choice
+            )
+
+    if scan["low_matches"]:
+        with st.expander(f"❓ 低信心度（< {MEDIUM_CONFIDENCE_THRESHOLD:.0%}），"
+                          f"請手動指定或忽略：{len(scan['low_matches'])} 個檔案", expanded=True):
+            for item in scan["low_matches"]:
+                options = ["— 不指定（略過）—"] + scan["names"]
+                choice = st.selectbox(
+                    item["fname"], options, index=0, key=f"low_{item['file']}",
+                )
+                st.session_state.low_selection[item["file"]] = (
+                    None if choice.startswith("—") else choice
+                )
+
+    st.divider()
+    process_btn = st.button("🚀 Step 2｜確認配對並開始處理", type="primary")
+
+    if process_btn:
+        run_finalize_and_store(scan, api_keys, selected_model)
+else:
+    st.info("請先於左側上傳人員名單 Excel 與證明文件 ZIP，並點擊「① 掃描並比對人員檔案」。")
+
+tab1, tab2, tab3 = st.tabs(["📜 附錄證照效期檢核", "🧾 CV 結構化預覽與編輯", "⬇️ 下載"])
+
+with tab1:
+    if st.session_state.df_license is not None and not st.session_state.df_license.empty:
+        st.dataframe(st.session_state.df_license, use_container_width=True, hide_index=True)
+        status_series = st.session_state.df_license["狀態"].astype(str)
+        n_expired = status_series.str.contains("已過期").sum()
+        n_soon = status_series.str.contains("即將過期").sum()
+        n_unknown = status_series.str.contains("⚠️").sum() - n_expired - n_soon
+        if n_expired > 0:
+            st.error(f"🔴 共有 {n_expired} 筆證照已過期，請優先處理！")
+        if n_soon > 0:
+            st.warning(f"🟡 共有 {n_soon} 筆證照即將於 90 天內到期。")
+        if n_unknown > 0:
+            st.info(f"⚠️ 共有 {n_unknown} 筆證照無法自動判讀效期，請人工確認。")
+    elif st.session_state.df_license is not None:
+        st.info("未偵測到任何技師執業執照或會員證檔案。")
+    else:
+        st.info("請先於左側上傳檔案並依序完成 Step 1 掃描配對與 Step 2 開始處理。")
+
+with tab2:
+    if st.session_state.df_staffing is not None:
+        diagnostics = st.session_state.diagnostics or {}
+
+        # ------------------------------------------------------------
+        # ① Mapping 與 AI 處理狀態儀表板
+        # ------------------------------------------------------------
+        total_people = len(diagnostics) if diagnostics else len(st.session_state.df_staffing)
+        n_success = sum(1 for d in diagnostics.values() if d.get("status") == "🟢 完整解析")
+        n_warning = sum(1 for d in diagnostics.values() if d.get("status") == "🟡 資料待補")
+        n_missing = sum(1 for d in diagnostics.values() if d.get("status") == "🔴 缺少 CV 檔案")
+        n_unmatched = len(st.session_state.unmatched_files)
+
+        st.markdown("#### 📊 Mapping 與 AI 處理狀態儀表板")
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("應處理人數", total_people)
+        m2.metric("🟢 CV 解析成功", n_success)
+        m3.metric("🟡 資料待補/AI 異常", n_warning)
+        m4.metric("🔴 缺少 CV 檔案", n_missing)
+        m5.metric("⚠️ 未比對檔案數", n_unmatched)
+
+        # ------------------------------------------------------------
+        # ② 警示區塊
+        # ------------------------------------------------------------
+        missing_people = [name for name, d in diagnostics.items() if d.get("status") == "🔴 缺少 CV 檔案"]
+        if missing_people:
+            st.error(
+                "以下人員缺乏 CV 履歷檔，已套用通用樣板保底（欄位不會空白，"
+                "但內容較籠統），建議於下方表格手動補充精確資訊或重新上傳 CV：\n\n"
+                + "、".join(missing_people)
+            )
+
+        warning_people = [(name, d.get("reason", "")) for name, d in diagnostics.items()
+                          if d.get("status") == "🟡 資料待補"]
+        if warning_people:
+            lines = "\n".join(f"- **{name}**：{reason}" for name, reason in warning_people)
+            st.warning("以下人員已套用「離線草稿保底」（BioNarrative／JobDescription 尚未經 AI 潤飾），"
+                       "欄位皆有內容，如需更精緻的敘述可檢查原因並視需要手動調整：\n\n" + lines)
+
+        if st.session_state.unmatched_files:
+            with st.expander(f"⚠️ 有 {len(st.session_state.unmatched_files)} 個檔案未成功比對到任何人員，"
+                              "可於此手動指定並重新處理", expanded=False):
+                st.caption("選擇對應人員後，點擊下方「套用修正並重新處理」即可將該檔案納入計算"
+                           "（會重新執行 OCR 與 AI，需再花費一些時間）。")
+                for item in st.session_state.unmatched_files:
+                    options = ["— 不指定（略過）—"] + st.session_state.scan["names"]
+                    current = st.session_state.low_selection.get(item["file"])
+                    default_idx = options.index(current) if current in options else 0
+                    choice = st.selectbox(
+                        item["fname"], options, index=default_idx,
+                        key=f"tab2_fix_{item['file']}",
+                    )
+                    st.session_state.low_selection[item["file"]] = (
+                        None if choice.startswith("—") else choice
+                    )
+                if st.button("🔄 套用修正並重新處理", key="tab2_apply_fix"):
+                    run_finalize_and_store(st.session_state.scan, api_keys, selected_model)
+                    st.rerun()
+
+        # ------------------------------------------------------------
+        # ③ 每位人員檔案配對明細（可摺疊）
+        # ------------------------------------------------------------
+        if diagnostics:
+            with st.expander("🔍 檢視每位人員配對到的完整檔案清單（CV / 學歷 / 證照 / 投保）",
+                              expanded=False):
+                for name in st.session_state.scan["names"] if st.session_state.scan else diagnostics.keys():
+                    diag = diagnostics.get(name)
+                    if diag:
+                        st.markdown(format_mapping_line(name, diag))
+
+        st.divider()
+
+        # ------------------------------------------------------------
+        # ④ 可編輯表格
+        # ------------------------------------------------------------
+        st.caption("可直接於表格中編輯任一欄位，或於最下方新增協力廠商（Subcontractor）資料列。")
+        edited_df = st.data_editor(
+            st.session_state.df_staffing,
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "Layer": st.column_config.SelectboxColumn(options=LAYER_OPTIONS),
+                "YearsOfExp": st.column_config.NumberColumn(min_value=0, step=1),
+            },
+            key="staffing_editor",
+        )
+        st.session_state.df_staffing = edited_df
+    else:
+        st.info("請先於左側上傳檔案並依序完成 Step 1 掃描配對與 Step 2 開始處理。")
+
+with tab3:
+    if st.session_state.df_staffing is not None:
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            try:
+                excel_bytes = build_template_excel(st.session_state.df_staffing)
+                st.download_button(
+                    "⬇️ 下載 Template_Staffing.xlsx",
+                    data=excel_bytes,
+                    file_name="Template_Staffing.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.error(f"Excel 產生失敗：{e}")
+
+        with col2:
+            if st.session_state.merged_pdf_bytes:
+                st.download_button(
+                    "⬇️ 下載 附錄_人員資格證明檔_Merged.pdf",
+                    data=st.session_state.merged_pdf_bytes,
+                    file_name="附錄_人員資格證明檔_Merged.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            else:
+                st.button("⬇️ 附錄 PDF（尚無資料）", disabled=True, use_container_width=True)
+
+        with col3:
+            try:
+                license_excel = build_license_report_excel(
+                    st.session_state.df_license if st.session_state.df_license is not None
+                    else pd.DataFrame(columns=["姓名", "文件類別", "檔名", "狀態", "起始日", "截止日", "備註"])
+                )
+                st.download_button(
+                    "⬇️ 下載 附錄人員資格與證照效期檢核報告.xlsx",
+                    data=license_excel,
+                    file_name="附錄人員資格與證照效期檢核報告.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.error(f"檢核報告產生失敗：{e}")
+    else:
+        st.info("請先於左側上傳檔案並依序完成 Step 1 掃描配對與 Step 2 開始處理。")
+
+st.divider()
+with st.expander("ℹ️ 使用說明與注意事項"):
+    st.markdown(f"""
+- **人員名單 Excel** 必須包含欄位：`順序`、`姓名`、`部門`、`團隊職務`；
+  建議另增 `英文姓名`（如 `Joe Lim`、`RAY HSU`）以提升檔名比對準確率，
+  未提供也不影響程式運作。
+- **三段式雙軌配對機制**：以「姓名」與「英文姓名」為比對清單，比對前一律轉小寫、
+  忽略大小寫，並移除 `_` `-` `()` `（）` 空格等符號差異，容許少量拼字誤差
+  （如 Brain/Brian）：
+  - 信心度 ≥ {HIGH_CONFIDENCE_THRESHOLD:.0%}：自動配對，於「已自動配對」清單顯示
+    （如「已自動配對：Brian Lo → 羅翊軒」）。
+  - 信心度 {MEDIUM_CONFIDENCE_THRESHOLD:.0%}～{HIGH_CONFIDENCE_THRESHOLD:.0%}：預設選中最高機率候選人，
+    可於畫面上一鍵確認或修正。
+  - 信心度 < {MEDIUM_CONFIDENCE_THRESHOLD:.0%}：需手動由下拉選單指定人員，或選擇略過。
+- **內文導向（Content-Driven）分類**：
+  - CV：檔名（不分大小寫）含「CV／履歷／學經歷／經歷表」，或副檔名為
+    `.doc`／`.docx`（含大寫 `.DOC`）→ 直接判定為 CV，不需 OCR。
+  - 技師執業執照：需先對 PDF／圖片進行文字擷取（含 OCR 備援），**內文**包含
+    「技師執業執照」或「執業執照」才成立，不再依賴檔名。
+  - 技師公會會員證：**內文同時**包含「會員證」與「技師公會」（如：台北市水利
+    技師公會、台灣省水利技師公會）才成立，避免景觀學會等一般協會會員證被
+    誤判。
+  - 投保證明／學歷證明：內容結構化程度低，維持以檔名關鍵字判斷。
+  - 其餘（一般協會會員證、電子證書等）：一律歸為一般證照，不進行過期告警。
+- **內文與 OCR 掃描進度**：Step 2 開始處理時，會先以進度條與狀態訊息顯示
+  「正在進行內文與 OCR 掃描：[檔名] (X/Y)」，掃描完成後才進入離線預填與 AI
+  摘要潤飾階段。
+- **離線預填滿 80% 欄位（Phase 1，零 API 消耗、零失敗）**：CV 全文一律完整讀取，
+  不做任何頁數/字數截斷；以下欄位純用 Python Regex 離線判定，永遠有內容：
+  - `Degree`：依「博士＞碩士＞研究所＞學士＞大學」優先序，在 CV 中搜尋含學歷
+    關鍵字的段落。
+  - `Company`／`Title`：搜尋 CV 中「現職／服務單位／職稱」等關鍵字段落。
+  - `Company`／`Title`：搜尋「現職／現 職／現任／服務單位」等段落，去除
+    「現職：」「現 職：」等前綴後，依公司名稱結尾關鍵字（分公司/股份有限
+    公司/事務所…）精準切分「公司全名」與「實際職稱」，並禁止把「職稱」
+    「服務單位」等表頭字樣本身填入欄位。
+  - `Badges`：學歷等級（碩/博）與管理類證照（品/安/採）只要關鍵字出現即可；
+    技師別／技術士別（水/土/景/乙/甲）**限定僅比對「證照檔名」與 CV 中
+    「學歷／證照／技師」相關段落**，且需與「技師/執照/證照」等執業字樣同
+    段落出現才判定，避免專案名稱（如「景觀改造計畫」）或純學歷科系（如
+    「土木工程學系」）被誤判為擁有對應技師徽章。
+  - `Expertise`：優先擷取 CV「專長」段落，清除項目符號／控制字元等亂碼後，
+    僅保留 2~10 字的精簡詞彙，統一輸出 4~6 個以「/」分隔的關鍵字（過濾長句
+    敘述）；找不到則以已判定的證照代碼展開為專長描述。
+  - `YearsOfExp`：100% 由 `6_投保證明`「勞保投保年資：X年 X日」離線換算
+    （日數 ≥180 進位 +1年，如 6年309日→7年）；無投保證明則為 0。
+  - `BioNarrative`／`JobDescription`：先以樣板組成完整保底版本。
+    `JobDescription` 依團隊職務（Role）**與**部門/組別（GroupName）動態
+    組合（如「於細部設計組擔任組員，執行細部設計與技術規範撰擬…」），
+    不會所有人套用同一句話。`BioNarrative` 採四段式標案範本風格：①學歷與
+    現職 ②代表性經歷（CV 中 1~2 項重點專案） ③核心專長 ④履約效益。
+- **AI 摘要潤飾（Phase 2，無縫降級）**：僅將 Phase 1 萃取出的「精簡結構化
+  草稿」（姓名/職務/組別/學歷/現職/年資/代表性經歷/專長，通常僅數百字）
+  送交 Gemini 潤飾成正式的四段式 `BioNarrative`（200字內）與依 Role+
+  GroupName 客製的 `JobDescription`（50字內），因此不需要對原始 CV 全文做
+  任何截斷即可處理任意頁數的長篇履歷（如 17 頁 CV）。**若 Gemini 呼叫失敗
+  （429/503/逾時/無 API Key），畫面僅顯示簡短提示（如「API 額度已達上限」），
+  不會裸露底層 JSON 錯誤堆疊，且絕不會填入「請手動補充」等佔位字樣，而是
+  直接沿用 Phase 1 的離線保底版本**，確保 Template_Staffing.xlsx 100%
+  產出完整內容。
+- **Gemini 模型鏈與限流防護**：預設候選模型為
+  `["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]`（移除不存在
+  的虛構模型 ID，避免無效試錯觸發連鎖 429/404）；每位人員的 AI 呼叫之間
+  固定間隔 1.0~1.5 秒隨機延遲，降低短時間內衝爆免費額度 RPM 上限的機率；
+  503／服務過載才進行指數退避重試。
+- **多 API Key 輪詢池**：側邊欄可輸入多組 API Key（以逗號分隔，如
+  `Key1, Key2`）；遇到 429 配額錯誤會立即無縫切換下一組 Key 重試，不等待。
+- **`determine_layer` 異體字相容**：「計畫」與「計劃」（畫／劃異體字）視為
+  同義，「計畫主持人」「計劃主持人」「副計畫主持人」「專案經理」等寫法皆可
+  正確判定 Layer，避免因用字差異被誤判為 `GroupMember`。
+- **CV 文字擷取**：PDF（含大寫 `.PDF`，內建 OCR 備援）與 Word（含大寫
+  `.DOC`／`.DOCX`）皆會完整擷取全文；輸出的 Template_Staffing.xlsx 維持原
+  13 欄標準格式。
+- **合併 PDF** 會依 Excel 的「順序」欄排列人員，同一人內再依
+  CV → 學歷 → 證照 → 執業執照 → 會員證 → 投保證明 排序，並加入書籤方便導覽。
+- **證照效期檢核**：僅針對「技師執業執照」與「技師會員證」兩類進行，其餘證照
+  類別不判斷過期；支援「執照有效期間：自民國X年X月X日至X年X月X日止」、
+  「有效期限：民國X年X月X日至X年X月X日」、「115年會員證／115年度會員證」
+  （自動推算至該年12月31日，如115+1911=2026年12月31日），以及**專門抓取
+  「至／~／止」後方截止日的備援規則**（因應 OCR 誤判或格式跑版導致起訖日
+  全段比對失敗，只要能辨識出「至118年9月6日止」等片段即可正確算出效期）；
+  日期一律以當下系統日期（`date.today()`）動態計算。**證照與投保證明的解析
+  全程為離線 Regex／OCR，完全不呼叫 Gemini API。**
+- **表格編輯即時同步**：`tab2` 的 `st.data_editor` 編輯結果會立即寫回
+  `st.session_state.df_staffing`；`tab3` 下載 `Template_Staffing.xlsx` 時
+  一律讀取當下最新的 `st.session_state.df_staffing`，因此任何手動修改
+  （Layer／BioNarrative 等）都會反映在下載檔案中。
+- 部署到 **Streamlit Community Cloud** 時，請將本工具一併產生的 `packages.txt`
+  放在 repo 根目錄，以安裝 LibreOffice 與 Tesseract 等系統套件。
+""")
